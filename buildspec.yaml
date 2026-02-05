@@ -4,6 +4,8 @@ env:
     AWS_REGION: us-east-1
     ECR_REPO: secure-health-api
     CONTAINER_NAME: secure-health-api
+    FAIL_ON_HIGH: "0"          # set to "1" to enforce HIGH threshold too
+    HIGH_THRESHOLD: "3"        # allowed HIGH findings if FAIL_ON_HIGH=1
 phases:
   pre_build:
     commands:
@@ -17,10 +19,68 @@ phases:
     commands:
       - echo "Building Docker image..."
       - docker build -t ${REPO_URI}:${IMAGE_TAG} ./app
-  post_build:
+    post_build:
     commands:
       - echo "Pushing Docker image..."
       - docker push ${REPO_URI}:${IMAGE_TAG}
+
+      # --- ECR scan gate: CRITICAL must be 0 (optionally enforce HIGH threshold) ---
+      - echo "Waiting for ECR image scan to complete for tag: ${IMAGE_TAG}"
+      - |
+        set -e
+        for i in $(seq 1 30); do
+          STATUS=$(aws ecr describe-images \
+            --region ${AWS_REGION} \
+            --repository-name ${ECR_REPO} \
+            --image-ids imageTag=${IMAGE_TAG} \
+            --query 'imageDetails[0].imageScanStatus.status' \
+            --output text || echo "UNKNOWN")
+          echo "Scan status: ${STATUS} (attempt ${i}/30)"
+          if [ "${STATUS}" = "COMPLETE" ]; then
+            break
+          fi
+          if [ "${STATUS}" = "FAILED" ]; then
+            echo "ECR scan FAILED"
+            exit 1
+          fi
+          sleep 5
+        done
+
+      - echo "Fetching scan findings summary..."
+      - |
+        set -e
+        CRITICAL=$(aws ecr describe-image-scan-findings \
+          --region ${AWS_REGION} \
+          --repository-name ${ECR_REPO} \
+          --image-id imageTag=${IMAGE_TAG} \
+          --query 'imageScanFindings.findingSeverityCounts.CRITICAL' \
+          --output text 2>/dev/null || echo "0")
+        HIGH=$(aws ecr describe-image-scan-findings \
+          --region ${AWS_REGION} \
+          --repository-name ${ECR_REPO} \
+          --image-id imageTag=${IMAGE_TAG} \
+          --query 'imageScanFindings.findingSeverityCounts.HIGH' \
+          --output text 2>/dev/null || echo "0")
+
+        # AWS CLI returns "None" sometimes when a key is missing
+        if [ "${CRITICAL}" = "None" ]; then CRITICAL=0; fi
+        if [ "${HIGH}" = "None" ]; then HIGH=0; fi
+
+        echo "ECR findings: CRITICAL=${CRITICAL}, HIGH=${HIGH}"
+
+        if [ "${CRITICAL}" -gt 0 ]; then
+          echo "FAIL: CRITICAL findings > 0"
+          exit 1
+        fi
+
+        if [ "${FAIL_ON_HIGH}" = "1" ] && [ "${HIGH}" -gt "${HIGH_THRESHOLD}" ]; then
+          echo "FAIL: HIGH findings (${HIGH}) exceed threshold (${HIGH_THRESHOLD})"
+          exit 1
+        fi
+
+        echo "PASS: ECR scan gate satisfied."
+
+      # --- Write imagedefinitions.json for ECS deploy ---
       - echo "Writing imagedefinitions.json..."
       - printf '[{"name":"%s","imageUri":"%s"}]' "${CONTAINER_NAME}" "${REPO_URI}:${IMAGE_TAG}" > imagedefinitions.json
       - cat imagedefinitions.json
