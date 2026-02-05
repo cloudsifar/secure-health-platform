@@ -1,11 +1,13 @@
 version: 0.2
+
 env:
   variables:
     AWS_REGION: us-east-1
     ECR_REPO: secure-health-api
     CONTAINER_NAME: secure-health-api
-    FAIL_ON_HIGH: "0"          # set to "1" to enforce HIGH threshold too
-    HIGH_THRESHOLD: "3"        # allowed HIGH findings if FAIL_ON_HIGH=1
+    FAIL_ON_HIGH: "0"
+    HIGH_THRESHOLD: "3"
+
 phases:
   pre_build:
     commands:
@@ -13,19 +15,22 @@ phases:
       - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
       - REPO_URI=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}
       - COMMIT_SHA=${CODEBUILD_RESOLVED_SOURCE_VERSION}
-      - IMAGE_TAG=${COMMIT_SHA:0:7}-${CODEBUILD_BUILD_NUMBER}  # <-- Added build number
+      - IMAGE_TAG=${COMMIT_SHA:0:7}-${CODEBUILD_BUILD_NUMBER}
       - aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+      - echo "Repo URI: ${REPO_URI}"
+      - echo "Image tag: ${IMAGE_TAG}"
+
   build:
     commands:
       - echo "Building Docker image..."
       - docker build -t ${REPO_URI}:${IMAGE_TAG} ./app
-    post_build:
+
+  post_build:
     commands:
       - echo "Pushing Docker image..."
       - docker push ${REPO_URI}:${IMAGE_TAG}
 
-      # --- ECR scan gate: CRITICAL must be 0 (optionally enforce HIGH threshold) ---
-      - echo "Waiting for ECR image scan to complete for tag: ${IMAGE_TAG}"
+      - echo "Waiting for ECR image scan to complete..."
       - |
         set -e
         for i in $(seq 1 30); do
@@ -62,7 +67,6 @@ phases:
           --query 'imageScanFindings.findingSeverityCounts.HIGH' \
           --output text 2>/dev/null || echo "0")
 
-        # AWS CLI returns "None" sometimes when a key is missing
         if [ "${CRITICAL}" = "None" ]; then CRITICAL=0; fi
         if [ "${HIGH}" = "None" ]; then HIGH=0; fi
 
@@ -80,10 +84,12 @@ phases:
 
         echo "PASS: ECR scan gate satisfied."
 
-      # --- Write imagedefinitions.json for ECS deploy ---
       - echo "Writing imagedefinitions.json..."
       - printf '[{"name":"%s","imageUri":"%s"}]' "${CONTAINER_NAME}" "${REPO_URI}:${IMAGE_TAG}" > imagedefinitions.json
+      - echo "Confirm artifact exists:"
+      - ls -l imagedefinitions.json
       - cat imagedefinitions.json
+
 artifacts:
   files:
     - imagedefinitions.json
