@@ -11,8 +11,6 @@ env:
     EXEC_ROLE_NAME: ecsTaskExecutionRole-secure-health-api
     IAM_WILDCARD_RESOURCE_ALLOWLIST: arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
 
-
-
 phases:
   pre_build:
     commands:
@@ -37,189 +35,182 @@ phases:
 
       - echo "Waiting for ECR image scan to complete..."
       - |
-        set -e
-        for i in $(seq 1 30); do
-          STATUS=$(aws ecr describe-images \
-            --region ${AWS_REGION} \
-            --repository-name ${ECR_REPO} \
-            --image-ids imageTag=${IMAGE_TAG} \
-            --query 'imageDetails[0].imageScanStatus.status' \
-            --output text || echo "UNKNOWN")
-          echo "Scan status: ${STATUS} (attempt ${i}/30)"
-          if [ "${STATUS}" = "COMPLETE" ]; then
-            break
-          fi
-          if [ "${STATUS}" = "FAILED" ]; then
-            echo "ECR scan FAILED"
-            exit 1
-          fi
-          sleep 5
-        done
+          set -e
+          for i in $(seq 1 30); do
+            STATUS=$(aws ecr describe-images \
+              --region ${AWS_REGION} \
+              --repository-name ${ECR_REPO} \
+              --image-ids imageTag=${IMAGE_TAG} \
+              --query 'imageDetails[0].imageScanStatus.status' \
+              --output text || echo "UNKNOWN")
+            echo "Scan status: ${STATUS} (attempt ${i}/30)"
+            if [ "${STATUS}" = "COMPLETE" ]; then
+              break
+            fi
+            if [ "${STATUS}" = "FAILED" ]; then
+              echo "ECR scan FAILED"
+              exit 1
+            fi
+            sleep 5
+          done
 
       - echo "Fetching scan findings summary..."
       - |
-        set -e
-        CRITICAL=$(aws ecr describe-image-scan-findings \
-          --region ${AWS_REGION} \
-          --repository-name ${ECR_REPO} \
-          --image-id imageTag=${IMAGE_TAG} \
-          --query 'imageScanFindings.findingSeverityCounts.CRITICAL' \
-          --output text 2>/dev/null || echo "0")
-        HIGH=$(aws ecr describe-image-scan-findings \
-          --region ${AWS_REGION} \
-          --repository-name ${ECR_REPO} \
-          --image-id imageTag=${IMAGE_TAG} \
-          --query 'imageScanFindings.findingSeverityCounts.HIGH' \
-          --output text 2>/dev/null || echo "0")
+          set -e
+          CRITICAL=$(aws ecr describe-image-scan-findings \
+            --region ${AWS_REGION} \
+            --repository-name ${ECR_REPO} \
+            --image-id imageTag=${IMAGE_TAG} \
+            --query 'imageScanFindings.findingSeverityCounts.CRITICAL' \
+            --output text 2>/dev/null || echo "0")
+          HIGH=$(aws ecr describe-image-scan-findings \
+            --region ${AWS_REGION} \
+            --repository-name ${ECR_REPO} \
+            --image-id imageTag=${IMAGE_TAG} \
+            --query 'imageScanFindings.findingSeverityCounts.HIGH' \
+            --output text 2>/dev/null || echo "0")
 
-        if [ "${CRITICAL}" = "None" ]; then CRITICAL=0; fi
-        if [ "${HIGH}" = "None" ]; then HIGH=0; fi
+          if [ "${CRITICAL}" = "None" ]; then CRITICAL=0; fi
+          if [ "${HIGH}" = "None" ]; then HIGH=0; fi
 
-        echo "ECR findings: CRITICAL=${CRITICAL}, HIGH=${HIGH}"
+          echo "ECR findings: CRITICAL=${CRITICAL}, HIGH=${HIGH}"
 
-        if [ "${CRITICAL}" -gt 0 ]; then
-          echo "FAIL: CRITICAL findings > 0"
-          exit 1
-        fi
+          if [ "${CRITICAL}" -gt 0 ]; then
+            echo "FAIL: CRITICAL findings > 0"
+            exit 1
+          fi
 
-        if [ "${FAIL_ON_HIGH}" = "1" ] && [ "${HIGH}" -gt "${HIGH_THRESHOLD}" ]; then
-          echo "FAIL: HIGH findings (${HIGH}) exceed threshold (${HIGH_THRESHOLD})"
-          exit 1
-        fi
+          if [ "${FAIL_ON_HIGH}" = "1" ] && [ "${HIGH}" -gt "${HIGH_THRESHOLD}" ]; then
+            echo "FAIL: HIGH findings (${HIGH}) exceed threshold (${HIGH_THRESHOLD})"
+            exit 1
+          fi
 
-        echo "PASS: ECR scan gate satisfied."
-              - echo "Running IAM wildcard gate (no Action:* ; Resource:* only if allowlisted)..."
+          echo "PASS: ECR scan gate satisfied."
+
+      - echo "Running IAM wildcard gate (no Action:* ; Resource:* only if allowlisted)..."
       - |
-        set -e
+          set -e
 
-        check_policy_doc () {
-          python3 - << 'PY'
-import json, os, sys
+          check_policy_doc () {
+            python3 - << 'PY'
+import json, sys
 
 policy = json.load(sys.stdin)
 
-def to_list(x):
-  if x is None: return []
-  return x if isinstance(x, list) else [x]
-
 def has_star(val):
-  # val can be "*", ["*"], or a list containing "*"
-  if isinstance(val, str):
-    return val.strip() == "*"
-  if isinstance(val, list):
-    return any(isinstance(v, str) and v.strip() == "*" for v in val)
-  return False
+    if isinstance(val, str):
+        return val.strip() == "*"
+    if isinstance(val, list):
+        return any(isinstance(v, str) and v.strip() == "*" for v in val)
+    return False
 
-bad = []
+bad = set()
+
 for stmt in policy.get("Statement", []):
-  # Statement can be dict or list
-  if isinstance(stmt, dict):
-    stmts = [stmt]
-  else:
-    stmts = stmt
+    stmts = [stmt] if isinstance(stmt, dict) else stmt
+    for s in stmts:
+        if s.get("Effect") != "Allow":
+            continue
 
-  for s in stmts:
-    effect = s.get("Effect", "")
-    if effect != "Allow":
-      continue
+        action = s.get("Action") or s.get("NotAction")
+        resource = s.get("Resource") or s.get("NotResource")
 
-    action = s.get("Action") or s.get("NotAction")
-    resource = s.get("Resource") or s.get("NotResource")
-
-    if has_star(action):
-      bad.append("Action:*")
-    if has_star(resource):
-      bad.append("Resource:*")
+        if has_star(action):
+            bad.add("Action:*")
+        if has_star(resource):
+            bad.add("Resource:*")
 
 if bad:
-  print("FOUND:", ", ".join(sorted(set(bad))))
-  sys.exit(2)
+    print("FOUND:", ", ".join(sorted(bad)))
+    sys.exit(2)
+
 print("OK")
 PY
-        }
+          }
 
-        is_allowlisted_policy () {
-          # $1 = policy ARN
-          IFS=',' read -ra ALLOW <<< "${IAM_WILDCARD_RESOURCE_ALLOWLIST}"
-          for a in "${ALLOW[@]}"; do
-            if [ "$1" = "$a" ]; then
-              return 0
-            fi
-          done
-          return 1
-        }
-
-        check_role () {
-          ROLE_NAME="$1"
-          echo "Checking role: ${ROLE_NAME}"
-
-          # 1) Inline policies on the role (we expect none; if present, we enforce strict)
-          INLINE=$(aws iam list-role-policies --role-name "${ROLE_NAME}" --query 'PolicyNames' --output text)
-          if [ "${INLINE}" != "None" ] && [ -n "${INLINE}" ]; then
-            for PNAME in ${INLINE}; do
-              echo " - Inline policy: ${PNAME}"
-              aws iam get-role-policy --role-name "${ROLE_NAME}" --policy-name "${PNAME}" --query 'PolicyDocument' --output json > /tmp/role-inline.json
-              # Inline policies: no exceptions. If Resource:* appears, fail.
-              if ! cat /tmp/role-inline.json | check_policy_doc; then
-                echo "FAIL: Wildcards found in inline policy ${PNAME} on ${ROLE_NAME}"
-                exit 1
+          is_allowlisted_policy () {
+            IFS=',' read -ra ALLOW <<< "${IAM_WILDCARD_RESOURCE_ALLOWLIST}"
+            for a in "${ALLOW[@]}"; do
+              if [ "$1" = "$a" ]; then
+                return 0
               fi
             done
-          fi
+            return 1
+          }
 
-          # 2) Attached managed policies
-          aws iam list-attached-role-policies --role-name "${ROLE_NAME}" --query 'AttachedPolicies[].PolicyArn' --output text | tr '\t' '\n' > /tmp/attached.txt || true
-          while read -r POLICY_ARN; do
-            [ -z "${POLICY_ARN}" ] && continue
-            echo " - Attached policy: ${POLICY_ARN}"
+          check_role () {
+            ROLE_NAME="$1"
+            echo "Checking role: ${ROLE_NAME}"
 
-            DEFAULT_VER=$(aws iam get-policy --policy-arn "${POLICY_ARN}" --query 'Policy.DefaultVersionId' --output text)
-            aws iam get-policy-version --policy-arn "${POLICY_ARN}" --version-id "${DEFAULT_VER}" --query 'PolicyVersion.Document' --output json > /tmp/policy.json
+            # Inline policies (strict: no Resource:* allowed here)
+            INLINE=$(aws iam list-role-policies --role-name "${ROLE_NAME}" --query 'PolicyNames' --output text)
+            if [ "${INLINE}" != "None" ] && [ -n "${INLINE}" ]; then
+              for PNAME in ${INLINE}; do
+                echo " - Inline policy: ${PNAME}"
+                aws iam get-role-policy --role-name "${ROLE_NAME}" --policy-name "${PNAME}" --query 'PolicyDocument' --output json > /tmp/role-inline.json
+                if ! cat /tmp/role-inline.json | check_policy_doc; then
+                  echo "FAIL: Wildcards found in inline policy ${PNAME} on ${ROLE_NAME}"
+                  exit 1
+                fi
+              done
+            fi
 
-            # Check for Action:* always (no exceptions).
-            # Resource:* allowed only if the whole policy is allowlisted.
-            set +e
-            OUT=$(cat /tmp/policy.json | python3 - << 'PY'
+            # Attached managed policies
+            aws iam list-attached-role-policies --role-name "${ROLE_NAME}" --query 'AttachedPolicies[].PolicyArn' --output text | tr '\t' '\n' > /tmp/attached.txt || true
+            while read -r POLICY_ARN; do
+              [ -z "${POLICY_ARN}" ] && continue
+              echo " - Attached policy: ${POLICY_ARN}"
+
+              DEFAULT_VER=$(aws iam get-policy --policy-arn "${POLICY_ARN}" --query 'Policy.DefaultVersionId' --output text)
+              aws iam get-policy-version --policy-arn "${POLICY_ARN}" --version-id "${DEFAULT_VER}" --query 'PolicyVersion.Document' --output json > /tmp/policy.json
+
+              # Find wildcards
+              OUT=$(cat /tmp/policy.json | python3 - << 'PY'
 import json, sys
 p=json.load(sys.stdin)
+
 def has_star(v):
-  if isinstance(v,str): return v.strip()=="*"
-  if isinstance(v,list): return any(isinstance(x,str) and x.strip()=="*" for x in v)
-  return False
+    if isinstance(v, str):
+        return v.strip() == "*"
+    if isinstance(v, list):
+        return any(isinstance(x, str) and x.strip() == "*" for x in v)
+    return False
+
 bad=set()
-for s in p.get("Statement", []):
-  if isinstance(s, dict): stmts=[s]
-  else: stmts=s
-  for st in stmts:
-    if st.get("Effect")!="Allow": continue
-    if has_star(st.get("Action") or st.get("NotAction")): bad.add("Action:*")
-    if has_star(st.get("Resource") or st.get("NotResource")): bad.add("Resource:*")
+for stmt in p.get("Statement", []):
+    stmts=[stmt] if isinstance(stmt, dict) else stmt
+    for st in stmts:
+        if st.get("Effect") != "Allow":
+            continue
+        if has_star(st.get("Action") or st.get("NotAction")):
+            bad.add("Action:*")
+        if has_star(st.get("Resource") or st.get("NotResource")):
+            bad.add("Resource:*")
+
 print(",".join(sorted(bad)))
 PY)
-            set -e
 
-            if echo "${OUT}" | grep -q "Action:\*"; then
-              echo "FAIL: Action:* found in managed policy ${POLICY_ARN}"
-              exit 1
-            fi
-
-            if echo "${OUT}" | grep -q "Resource:\*"; then
-              if is_allowlisted_policy "${POLICY_ARN}"; then
-                echo "   NOTE: Resource:* allowed for allowlisted policy ${POLICY_ARN}"
-              else
-                echo "FAIL: Resource:* found in managed policy ${POLICY_ARN} (not allowlisted)"
+              if echo "${OUT}" | grep -q "Action:\*"; then
+                echo "FAIL: Action:* found in managed policy ${POLICY_ARN}"
                 exit 1
               fi
-            fi
 
-          done < /tmp/attached.txt
-        }
+              if echo "${OUT}" | grep -q "Resource:\*"; then
+                if is_allowlisted_policy "${POLICY_ARN}"; then
+                  echo "   NOTE: Resource:* allowed for allowlisted policy ${POLICY_ARN}"
+                else
+                  echo "FAIL: Resource:* found in managed policy ${POLICY_ARN} (not allowlisted)"
+                  exit 1
+                fi
+              fi
 
-        check_role "${TASK_ROLE_NAME}"
-        check_role "${EXEC_ROLE_NAME}"
+            done < /tmp/attached.txt
+          }
 
-        echo "PASS: IAM wildcard gate satisfied."
+          check_role "${TASK_ROLE_NAME}"
+          check_role "${EXEC_ROLE_NAME}"
 
+          echo "PASS: IAM wildcard gate satisfied."
 
       - echo "Writing imagedefinitions.json..."
       - printf '[{"name":"%s","imageUri":"%s"}]' "${CONTAINER_NAME}" "${REPO_URI}:${IMAGE_TAG}" > imagedefinitions.json
