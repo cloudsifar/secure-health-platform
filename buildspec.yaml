@@ -10,6 +10,8 @@ env:
     TASK_ROLE_NAME: ecsTaskRole-secure-health-api
     EXEC_ROLE_NAME: ecsTaskExecutionRole-secure-health-api
     IAM_WILDCARD_RESOURCE_ALLOWLIST: arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+    IAM_VALIDATE_FAIL_ON: "ERROR"
+
 
 phases:
   pre_build:
@@ -89,6 +91,9 @@ phases:
 
       - echo "Running IAM wildcard gate..."
       - python3 scripts/ci_iam_wildcard_gate.py
+
+      - echo "Running IAM ValidatePolicy gate..."
+      - python3 scripts/ci_iam_validate_policy_gate.py
 
       - echo "Writing imagedefinitions.json..."
       - printf '[{"name":"%s","imageUri":"%s"}]' "${CONTAINER_NAME}" "${REPO_URI}:${IMAGE_TAG}" > imagedefinitions.json
