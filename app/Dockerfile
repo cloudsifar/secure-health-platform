@@ -1,4 +1,4 @@
-FROM public.ecr.aws/docker/library/python:3.01-slim
+FROM public.ecr.aws/docker/library/python:3.12-slim
 
 # Basic hardening-ish defaults
 ENV PYTHONDONTWRITEBYTECODE=1 \
