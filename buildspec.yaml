@@ -32,7 +32,6 @@ phases:
 
   post_build:
     commands:
-      # --- Failure notification trap (Gate-aware) ---
       - |
           set -euo pipefail
 
@@ -65,100 +64,85 @@ phases:
 
           trap 'log_step "[TRAP] Failure detected in ${CURRENT_GATE}"; notify_failure' ERR
 
-      # --- Build + Push ---
-      - |
+          # --- Build + Push ---
           CURRENT_GATE="Build/Push: Docker push to ECR"
           log_step "== ${CURRENT_GATE} =="
-      - echo "Pushing Docker image..." | tee -a /tmp/gate_summary.txt
-      - docker push ${REPO_URI}:${IMAGE_TAG} 2>&1 | tee -a /tmp/gate_summary.txt
+          echo "Pushing Docker image..." | tee -a "${SUMMARY_FILE}"
+          docker push "${REPO_URI}:${IMAGE_TAG}" 2>&1 | tee -a "${SUMMARY_FILE}"
 
-      # --- Gate 1: ECR Scan ---
-      - |
+          # --- Gate 1: ECR Scan ---
           CURRENT_GATE="Gate 1: ECR Vulnerability Scan"
           log_step "== ${CURRENT_GATE} =="
-      - echo "Waiting for ECR image scan to complete..." | tee -a /tmp/gate_summary.txt
-      - |
-          set -e
+          echo "Waiting for ECR image scan to complete..." | tee -a "${SUMMARY_FILE}"
+          
           for i in $(seq 1 30); do
-            STATUS=$(aws ecr describe-images \
-              --region ${AWS_REGION} \
-              --repository-name ${ECR_REPO} \
-              --image-ids imageTag=${IMAGE_TAG} \
+            STATUS="$(aws ecr describe-images \
+              --region "${AWS_REGION}" \
+              --repository-name "${ECR_REPO}" \
+              --image-ids imageTag="${IMAGE_TAG}" \
               --query 'imageDetails[0].imageScanStatus.status' \
-              --output text || echo "UNKNOWN")
-            echo "Scan status: ${STATUS} (attempt ${i}/30)" | tee -a /tmp/gate_summary.txt
-            if [ "${STATUS}" = "COMPLETE" ]; then
+              --output text || echo "UNKNOWN")"
+            echo "Scan status: ${STATUS} (attempt ${i}/30)" | tee -a "${SUMMARY_FILE}"
+            if [ "${STATUS}" = "COMPLETE" ]; then 
               break
             fi
             if [ "${STATUS}" = "FAILED" ]; then
-              echo "ECR scan FAILED" | tee -a /tmp/gate_summary.txt
+              echo "ECR scan FAILED" | tee -a "${SUMMARY_FILE}"
               exit 1
             fi
             sleep 5
           done
 
-      - echo "Fetching scan findings summary..." | tee -a /tmp/gate_summary.txt
-      - |
-          set -e
-          CRITICAL=$(aws ecr describe-image-scan-findings \
-            --region ${AWS_REGION} \
-            --repository-name ${ECR_REPO} \
-            --image-id imageTag=${IMAGE_TAG} \
+          echo "Fetching scan findings summary..." | tee -a "${SUMMARY_FILE}"
+          CRITICAL="$(aws ecr describe-image-scan-findings \
+            --region "${AWS_REGION}" \
+            --repository-name "${ECR_REPO}" \
+            --image-id imageTag="${IMAGE_TAG}" \
             --query 'imageScanFindings.findingSeverityCounts.CRITICAL' \
-            --output text 2>/dev/null || echo "0")
-          HIGH=$(aws ecr describe-image-scan-findings \
-            --region ${AWS_REGION} \
-            --repository-name ${ECR_REPO} \
-            --image-id imageTag=${IMAGE_TAG} \
+            --output text 2>/dev/null || echo "0")"
+          HIGH="$(aws ecr describe-image-scan-findings \
+            --region "${AWS_REGION}" \
+            --repository-name "${ECR_REPO}" \
+            --image-id imageTag="${IMAGE_TAG}" \
             --query 'imageScanFindings.findingSeverityCounts.HIGH' \
-            --output text 2>/dev/null || echo "0")
+            --output text 2>/dev/null || echo "0")"
 
           if [ "${CRITICAL}" = "None" ]; then CRITICAL=0; fi
           if [ "${HIGH}" = "None" ]; then HIGH=0; fi
 
-          echo "ECR findings: CRITICAL=${CRITICAL}, HIGH=${HIGH}" | tee -a /tmp/gate_summary.txt
+          echo "ECR findings: CRITICAL=${CRITICAL}, HIGH=${HIGH}" | tee -a "${SUMMARY_FILE}"
 
           if [ "${CRITICAL}" -gt 0 ]; then
-            echo "FAIL: CRITICAL findings > 0" | tee -a /tmp/gate_summary.txt
+            echo "FAIL: CRITICAL findings > 0" | tee -a "${SUMMARY_FILE}"
             exit 1
           fi
-
           if [ "${FAIL_ON_HIGH}" = "1" ] && [ "${HIGH}" -gt "${HIGH_THRESHOLD}" ]; then
-            echo "FAIL: HIGH findings (${HIGH}) exceed threshold (${HIGH_THRESHOLD})" | tee -a /tmp/gate_summary.txt
+            echo "FAIL: HIGH findings (${HIGH}) exceed threshold (${HIGH_THRESHOLD})" | tee -a "${SUMMARY_FILE}"
             exit 1
           fi
+          echo "PASS: ECR scan gate satisfied." | tee -a "${SUMMARY_FILE}"
 
-          echo "PASS: ECR scan gate satisfied." | tee -a /tmp/gate_summary.txt
-
-      # --- Gate 2: IAM Wildcard ---
-      - |
+          # --- Gate 2: IAM Wildcard ---
           CURRENT_GATE="Gate 2: IAM Wildcard Gate"
           log_step "== ${CURRENT_GATE} =="
-      - echo "Running IAM wildcard gate..." | tee -a /tmp/gate_summary.txt
-      - python3 scripts/ci_iam_wildcard_gate.py 2>&1 | tee -a /tmp/gate_summary.txt
+          python3 scripts/ci_iam_wildcard_gate.py 2>&1 | tee -a "${SUMMARY_FILE}"
 
-      # --- Gate 3: IAM ValidatePolicy (Access Analyzer) ---
-      - |
+          # --- Gate 3: IAM ValidatePolicy ---
           CURRENT_GATE="Gate 3: IAM ValidatePolicy Gate"
           log_step "== ${CURRENT_GATE} =="
-      - echo "Running IAM ValidatePolicy gate..." | tee -a /tmp/gate_summary.txt
-      - python3 scripts/ci_iam_validate_policy_gate.py 2>&1 | tee -a /tmp/gate_summary.txt
+          python3 scripts/ci_iam_validate_policy_gate.py 2>&1 | tee -a "${SUMMARY_FILE}"
 
-      # --- Gate 4: Secrets Detection ---
-      - |
+          # --- Gate 4: Secrets Detection ---
           CURRENT_GATE="Gate 4: Secrets Detection Gate"
           log_step "== ${CURRENT_GATE} =="
-      - echo "Running Secrets Detection gate..." | tee -a /tmp/gate_summary.txt
-      - python3 scripts/ci_secrets_gate.py 2>&1 | tee -a /tmp/gate_summary.txt
+          python3 scripts/ci_secrets_gate.py 2>&1 | tee -a "${SUMMARY_FILE}"
 
-      # --- Artifact for ECS deploy stage ---
-      - |
+          # --- Artifact ---
           CURRENT_GATE="Artifacts: Write imagedefinitions.json"
           log_step "== ${CURRENT_GATE} =="
-      - echo "Writing imagedefinitions.json..." | tee -a /tmp/gate_summary.txt
-      - printf '[{"name":"%s","imageUri":"%s"}]' "${CONTAINER_NAME}" "${REPO_URI}:${IMAGE_TAG}" > imagedefinitions.json
-      - ls -l imagedefinitions.json | tee -a /tmp/gate_summary.txt
-      - cat imagedefinitions.json | tee -a /tmp/gate_summary.txt
+          printf '[{"name":"%s","imageUri":"%s"}]' "${CONTAINER_NAME}" "${REPO_URI}:${IMAGE_TAG}" > imagedefinitions.json
+          ls -l imagedefinitions.json | tee -a "${SUMMARY_FILE}"
+          cat imagedefinitions.json | tee -a "${SUMMARY_FILE}"
 
 artifacts:
   files:
