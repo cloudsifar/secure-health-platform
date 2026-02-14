@@ -1,3 +1,5 @@
+""" Basic functional script for the container """
+
 from fastapi import FastAPI
 from datetime import datetime, timezone
 
