@@ -1,5 +1,8 @@
 FROM public.ecr.aws/docker/library/python:3.12-slim
 
+LABEL build_timestamp="2026-02-15T21:50:00Z"
+
+
 # Basic hardening-ish defaults
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
