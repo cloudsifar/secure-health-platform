@@ -30,3 +30,4 @@ Gate B: Custom IAM wildcard detection (prevents Action:/Resource: except allowli
 Gate C: AWS Access Analyzer policy validation (catches syntax errors, security warnings)
 
 Currently developing Gate D and a reporting tool. Will provide full Readme upon completion
+

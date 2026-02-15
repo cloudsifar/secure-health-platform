@@ -70,28 +70,37 @@ phases:
           echo "Pushing Docker image..." | tee -a "${SUMMARY_FILE}"
           docker push "${REPO_URI}:${IMAGE_TAG}" 2>&1 | tee -a "${SUMMARY_FILE}"
 
-          # --- Gate 1: ECR Scan ---
-          CURRENT_GATE="Gate 1: ECR Vulnerability Scan"
+          # --- Gate 1: Inspector Vulnerability Scan ---
+          CURRENT_GATE="Gate 1: ECR Vulnerability Scan (Inspector Enhanced)"
           log_step "== ${CURRENT_GATE} =="
-          echo "Waiting for ECR image scan to complete..." | tee -a "${SUMMARY_FILE}"
+          echo "Waiting for Inspector scan to complete..." | tee -a "${SUMMARY_FILE}"
           
           for i in $(seq 1 30); do
-            STATUS="$(aws ecr describe-images \
+            SCAN_STATUS="$(aws ecr describe-image-scan-findings \
               --region "${AWS_REGION}" \
               --repository-name "${ECR_REPO}" \
-              --image-ids imageTag="${IMAGE_TAG}" \
-              --query 'imageDetails[0].imageScanStatus.status' \
-              --output text || echo "UNKNOWN")"
-            echo "Scan status: ${STATUS} (attempt ${i}/30)" | tee -a "${SUMMARY_FILE}"
-            if [ "${STATUS}" = "COMPLETE" ]; then 
+              --image-id imageTag="${IMAGE_TAG}" \
+              --query 'imageScanStatus.status' \
+              --output text 2>/dev/null || echo "NONE")"
+            
+            echo "Scan status: ${SCAN_STATUS} (attempt ${i}/30)" | tee -a "${SUMMARY_FILE}"
+            
+            if [ "${SCAN_STATUS}" = "COMPLETE" ]; then
               break
             fi
-            if [ "${STATUS}" = "FAILED" ]; then
-              echo "ECR scan FAILED" | tee -a "${SUMMARY_FILE}"
+            if [ "${SCAN_STATUS}" = "FAILED" ]; then
+              echo "Inspector scan FAILED" | tee -a "${SUMMARY_FILE}"
               exit 1
             fi
             sleep 5
           done
+
+          # Failsafe: ensure scan actually completed
+          if [ "${SCAN_STATUS}" != "COMPLETE" ]; then
+            echo "FAIL: Inspector scan never completed (final status: ${SCAN_STATUS})" | tee -a "${SUMMARY_FILE}"
+            echo "Verify Enhanced scanning is enabled: aws ecr get-registry-scanning-configuration --region ${AWS_REGION}" | tee -a "${SUMMARY_FILE}"
+            exit 1
+          fi
 
           echo "Fetching scan findings summary..." | tee -a "${SUMMARY_FILE}"
           CRITICAL="$(aws ecr describe-image-scan-findings \
