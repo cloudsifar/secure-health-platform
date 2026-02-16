@@ -58,7 +58,7 @@ phases:
             aws sns publish \
               --region "${AWS_REGION}" \
               --topic-arn "${SNS_TOPIC_ARN}" \
-              --subject "🚨 cp-secure-health-platform FAILED (${CURRENT_GATE})" \
+              --subject "cp-secure-health-platform FAILED (${CURRENT_GATE})" \
               --message "${MESSAGE}"
           }
 
@@ -75,23 +75,44 @@ phases:
           log_step "== ${CURRENT_GATE} =="
           echo "Waiting for Inspector scan to complete..." | tee -a "${SUMMARY_FILE}"
           
-          # Give Inspector a moment to start scanning after push
-          sleep 10
+          # Poll Inspector for findings (up to 3 minutes)
+          MAX_ATTEMPTS=36
+          SLEEP_INTERVAL=5
+          ATTEMPT=0
           
-          # Query Inspector directly for findings
-          echo "Fetching Inspector findings..." | tee -a "${SUMMARY_FILE}"
-          
-          # Get findings for this specific image
-          FINDINGS_JSON="$(aws inspector2 list-findings \
-            --region "${AWS_REGION}" \
-            --filter-criteria "{\"ecrImageTags\":[{\"comparison\":\"EQUALS\",\"value\":\"${IMAGE_TAG}\"}]}" \
-            --max-results 100 \
-            --output json 2>/dev/null || echo '{}')"
+          while [ ${ATTEMPT} -lt ${MAX_ATTEMPTS} ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            
+            FINDINGS_JSON="$(aws inspector2 list-findings \
+              --region "${AWS_REGION}" \
+              --filter-criteria "{\"ecrImageTags\":[{\"comparison\":\"EQUALS\",\"value\":\"${IMAGE_TAG}\"}]}" \
+              --max-results 100 \
+              --output json 2>/dev/null || echo '{}')"
+            
+            # Check if we got any findings back
+            FINDING_COUNT=$(echo "${FINDINGS_JSON}" | jq -r '.findings | length' 2>/dev/null || echo "0")
+            
+            echo "Inspector scan attempt ${ATTEMPT}/${MAX_ATTEMPTS}: ${FINDING_COUNT} findings" | tee -a "${SUMMARY_FILE}"
+            
+            # If we have findings, break
+            if [ "${FINDING_COUNT}" -gt 0 ]; then
+              echo "Inspector scan complete - findings detected" | tee -a "${SUMMARY_FILE}"
+              break
+            fi
+            
+            # If this is the last attempt, accept 0 findings as valid
+            if [ ${ATTEMPT} -eq ${MAX_ATTEMPTS} ]; then
+              echo "Inspector scan timeout - assuming no vulnerabilities found" | tee -a "${SUMMARY_FILE}"
+              break
+            fi
+            
+            sleep ${SLEEP_INTERVAL}
+          done
           
           # Count findings by severity
-          CRITICAL=$(echo "${FINDINGS_JSON}" | jq -r '[.findings[] | select(.severity=="CRITICAL")] | length' || echo "0")
-          HIGH=$(echo "${FINDINGS_JSON}" | jq -r '[.findings[] | select(.severity=="HIGH")] | length' || echo "0")
-          MEDIUM=$(echo "${FINDINGS_JSON}" | jq -r '[.findings[] | select(.severity=="MEDIUM")] | length' || echo "0")
+          CRITICAL=$(echo "${FINDINGS_JSON}" | jq -r '[.findings[] | select(.severity=="CRITICAL")] | length' 2>/dev/null || echo "0")
+          HIGH=$(echo "${FINDINGS_JSON}" | jq -r '[.findings[] | select(.severity=="HIGH")] | length' 2>/dev/null || echo "0")
+          MEDIUM=$(echo "${FINDINGS_JSON}" | jq -r '[.findings[] | select(.severity=="MEDIUM")] | length' 2>/dev/null || echo "0")
           
           echo "Inspector findings: CRITICAL=${CRITICAL}, HIGH=${HIGH}, MEDIUM=${MEDIUM}" | tee -a "${SUMMARY_FILE}"
           
