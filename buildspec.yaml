@@ -79,22 +79,26 @@ phases:
           IMAGE_DIGEST=$(docker inspect "${REPO_URI}:${IMAGE_TAG}" --format='{{index .RepoDigests 0}}' | cut -d'@' -f2)
           echo "Image digest: ${IMAGE_DIGEST}" | tee -a "${SUMMARY_FILE}"
 
+          # Temp files for JSON (avoids ARG_MAX shell variable limits on large responses)
+          RAW_FILE="/tmp/inspector_raw.json"
+          FILTERED_FILE="/tmp/inspector_filtered.json"
+          echo '{"findings":[]}' > "${FILTERED_FILE}"
+
           # Poll Inspector for findings (up to 3 minutes)
           MAX_ATTEMPTS=36
           SLEEP_INTERVAL=5
           ATTEMPT=0
-          FINDINGS_JSON='{"findings":[]}'
 
           while [ ${ATTEMPT} -lt ${MAX_ATTEMPTS} ]; do
             ATTEMPT=$((ATTEMPT + 1))
 
-            # Query by repository name (FIXED: ecrImageRepositoryName, not ecrRepositoryName)
+            # Query by repository name - write directly to file, not shell variable
             # Fail-closed: API errors block the pipeline instead of silently passing
-            RAW_FINDINGS="$(aws inspector2 list-findings \
+            aws inspector2 list-findings \
               --region "${AWS_REGION}" \
               --filter-criteria "{\"ecrImageRepositoryName\":[{\"comparison\":\"EQUALS\",\"value\":\"${ECR_REPO}\"}]}" \
               --max-results 100 \
-              --output json)" || {
+              --output json > "${RAW_FILE}" || {
                 echo "FAIL: Inspector API query failed - blocking deployment" | tee -a "${SUMMARY_FILE}"
                 exit 1
               }
@@ -102,32 +106,31 @@ phases:
             # Debug: on first attempt, dump structure of first finding to verify jq paths
             if [ ${ATTEMPT} -eq 1 ]; then
               echo "--- DEBUG: Raw finding count from API ---" | tee -a "${SUMMARY_FILE}"
-              RAW_COUNT=$(echo "${RAW_FINDINGS}" | jq '.findings | length')
-              echo "Total findings for repository: ${RAW_COUNT}" | tee -a "${SUMMARY_FILE}"
+              jq '.findings | length' "${RAW_FILE}" | tee -a "${SUMMARY_FILE}"
               echo "--- DEBUG: First finding resource structure ---" | tee -a "${SUMMARY_FILE}"
-              echo "${RAW_FINDINGS}" | jq '.findings[0].resources[0].details.awsEcrContainerImage // "NO_ECR_IMAGE_DETAILS"' 2>/dev/null | head -20 | tee -a "${SUMMARY_FILE}"
+              jq '.findings[0].resources[0].details.awsEcrContainerImage // "NO_ECR_IMAGE_DETAILS"' "${RAW_FILE}" | head -20 | tee -a "${SUMMARY_FILE}"
               echo "--- DEBUG: First finding imageHash value ---" | tee -a "${SUMMARY_FILE}"
-              echo "${RAW_FINDINGS}" | jq -r '.findings[0].resources[0].details.awsEcrContainerImage.imageHash // "FIELD_NOT_FOUND"' 2>/dev/null | tee -a "${SUMMARY_FILE}"
+              jq -r '.findings[0].resources[0].details.awsEcrContainerImage.imageHash // "FIELD_NOT_FOUND"' "${RAW_FILE}" | tee -a "${SUMMARY_FILE}"
               echo "--- DEBUG: Expected digest ---" | tee -a "${SUMMARY_FILE}"
               echo "${IMAGE_DIGEST}" | tee -a "${SUMMARY_FILE}"
               echo "--- END DEBUG ---" | tee -a "${SUMMARY_FILE}"
             fi
 
-            # Filter for this specific image digest using jq
-            FILTERED_FINDINGS=$(echo "${RAW_FINDINGS}" | jq --arg digest "${IMAGE_DIGEST}" \
-              '{findings: [.findings[] | select(.resources[0].details.awsEcrContainerImage.imageHash == $digest)]}') || {
+            # Filter for this specific image digest - file to file
+            jq --arg digest "${IMAGE_DIGEST}" \
+              '{findings: [.findings[] | select(.resources[0].details.awsEcrContainerImage.imageHash == $digest)]}' \
+              "${RAW_FILE}" > "${FILTERED_FILE}" || {
                 echo "FAIL: jq filtering failed - blocking deployment" | tee -a "${SUMMARY_FILE}"
                 exit 1
               }
 
-            FINDING_COUNT=$(echo "${FILTERED_FINDINGS}" | jq -r '.findings | length')
+            FINDING_COUNT=$(jq -r '.findings | length' "${FILTERED_FILE}")
 
             echo "Inspector scan attempt ${ATTEMPT}/${MAX_ATTEMPTS}: ${FINDING_COUNT} findings" | tee -a "${SUMMARY_FILE}"
 
             # If we have findings, break
             if [ "${FINDING_COUNT}" -gt 0 ]; then
               echo "Inspector scan complete - findings detected" | tee -a "${SUMMARY_FILE}"
-              FINDINGS_JSON="${FILTERED_FINDINGS}"
               break
             fi
 
@@ -140,10 +143,13 @@ phases:
             sleep ${SLEEP_INTERVAL}
           done
 
-          # Count findings by severity
-          CRITICAL=$(echo "${FINDINGS_JSON}" | jq -r '[.findings[] | select(.severity=="CRITICAL")] | length')
-          HIGH=$(echo "${FINDINGS_JSON}" | jq -r '[.findings[] | select(.severity=="HIGH")] | length')
-          MEDIUM=$(echo "${FINDINGS_JSON}" | jq -r '[.findings[] | select(.severity=="MEDIUM")] | length')
+          # Count findings by severity (from filtered file)
+          CRITICAL=$(jq -r '[.findings[] | select(.severity=="CRITICAL")] | length' "${FILTERED_FILE}")
+          HIGH=$(jq -r '[.findings[] | select(.severity=="HIGH")] | length' "${FILTERED_FILE}")
+          MEDIUM=$(jq -r '[.findings[] | select(.severity=="MEDIUM")] | length' "${FILTERED_FILE}")
+
+          # Clean up temp files
+          rm -f "${RAW_FILE}" "${FILTERED_FILE}"
 
           echo "Inspector findings: CRITICAL=${CRITICAL}, HIGH=${HIGH}, MEDIUM=${MEDIUM}" | tee -a "${SUMMARY_FILE}"
 
