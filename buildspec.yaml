@@ -45,16 +45,16 @@ phases:
           notify_failure () {
             LOG_SNIPPET="$(tail -n 40 "${SUMMARY_FILE}" 2>/dev/null || true)"
             MESSAGE="Secure Health Platform pipeline failure.
-          
+
           Gate: ${CURRENT_GATE}
           Repo: ${CODEBUILD_SOURCE_REPO_URL:-unknown}
           Commit: ${CODEBUILD_RESOLVED_SOURCE_VERSION:-unknown}
           Image: ${REPO_URI:-unknown}:${IMAGE_TAG:-unknown}
           Build ID: ${CODEBUILD_BUILD_ID:-unknown}
-          
+
           Recent log summary:
           ${LOG_SNIPPET}"
-            
+
             aws sns publish \
               --region "${AWS_REGION}" \
               --topic-arn "${SNS_TOPIC_ARN}" \
@@ -74,67 +74,89 @@ phases:
           CURRENT_GATE="Gate 1: ECR Vulnerability Scan (Inspector Enhanced)"
           log_step "== ${CURRENT_GATE} =="
           echo "Waiting for Inspector scan to complete..." | tee -a "${SUMMARY_FILE}"
-          
+
           # Get the image digest from the push
           IMAGE_DIGEST=$(docker inspect "${REPO_URI}:${IMAGE_TAG}" --format='{{index .RepoDigests 0}}' | cut -d'@' -f2)
           echo "Image digest: ${IMAGE_DIGEST}" | tee -a "${SUMMARY_FILE}"
-          
+
           # Poll Inspector for findings (up to 3 minutes)
           MAX_ATTEMPTS=36
           SLEEP_INTERVAL=5
           ATTEMPT=0
-          
+          FINDINGS_JSON='{"findings":[]}'
+
           while [ ${ATTEMPT} -lt ${MAX_ATTEMPTS} ]; do
             ATTEMPT=$((ATTEMPT + 1))
-            
-            # Query by repository and filter in jq for this specific digest
-            FINDINGS_JSON="$(aws inspector2 list-findings \
+
+            # Query by repository name (FIXED: ecrImageRepositoryName, not ecrRepositoryName)
+            # Fail-closed: API errors block the pipeline instead of silently passing
+            RAW_FINDINGS="$(aws inspector2 list-findings \
               --region "${AWS_REGION}" \
-              --filter-criteria "{\"ecrRepositoryName\":[{\"comparison\":\"EQUALS\",\"value\":\"${ECR_REPO}\"}]}" \
+              --filter-criteria "{\"ecrImageRepositoryName\":[{\"comparison\":\"EQUALS\",\"value\":\"${ECR_REPO}\"}]}" \
               --max-results 100 \
-              --output json 2>/dev/null || echo '{}')"
-            
+              --output json)" || {
+                echo "FAIL: Inspector API query failed - blocking deployment" | tee -a "${SUMMARY_FILE}"
+                exit 1
+              }
+
+            # Debug: on first attempt, dump structure of first finding to verify jq paths
+            if [ ${ATTEMPT} -eq 1 ]; then
+              echo "--- DEBUG: Raw finding count from API ---" | tee -a "${SUMMARY_FILE}"
+              RAW_COUNT=$(echo "${RAW_FINDINGS}" | jq '.findings | length')
+              echo "Total findings for repository: ${RAW_COUNT}" | tee -a "${SUMMARY_FILE}"
+              echo "--- DEBUG: First finding resource structure ---" | tee -a "${SUMMARY_FILE}"
+              echo "${RAW_FINDINGS}" | jq '.findings[0].resources[0].details.awsEcrContainerImage // "NO_ECR_IMAGE_DETAILS"' 2>/dev/null | head -20 | tee -a "${SUMMARY_FILE}"
+              echo "--- DEBUG: First finding imageHash value ---" | tee -a "${SUMMARY_FILE}"
+              echo "${RAW_FINDINGS}" | jq -r '.findings[0].resources[0].details.awsEcrContainerImage.imageHash // "FIELD_NOT_FOUND"' 2>/dev/null | tee -a "${SUMMARY_FILE}"
+              echo "--- DEBUG: Expected digest ---" | tee -a "${SUMMARY_FILE}"
+              echo "${IMAGE_DIGEST}" | tee -a "${SUMMARY_FILE}"
+              echo "--- END DEBUG ---" | tee -a "${SUMMARY_FILE}"
+            fi
+
             # Filter for this specific image digest using jq
-            FILTERED_FINDINGS=$(echo "${FINDINGS_JSON}" | jq --arg digest "${IMAGE_DIGEST}" \
-              '{findings: [.findings[] | select(.resources[0].details.awsEcrContainerImage.imageHash == $digest)]}' 2>/dev/null || echo '{"findings":[]}')
-            
-            FINDING_COUNT=$(echo "${FILTERED_FINDINGS}" | jq -r '.findings | length' 2>/dev/null || echo "0")
-            
+            FILTERED_FINDINGS=$(echo "${RAW_FINDINGS}" | jq --arg digest "${IMAGE_DIGEST}" \
+              '{findings: [.findings[] | select(.resources[0].details.awsEcrContainerImage.imageHash == $digest)]}') || {
+                echo "FAIL: jq filtering failed - blocking deployment" | tee -a "${SUMMARY_FILE}"
+                exit 1
+              }
+
+            FINDING_COUNT=$(echo "${FILTERED_FINDINGS}" | jq -r '.findings | length')
+
             echo "Inspector scan attempt ${ATTEMPT}/${MAX_ATTEMPTS}: ${FINDING_COUNT} findings" | tee -a "${SUMMARY_FILE}"
-            
+
             # If we have findings, break
             if [ "${FINDING_COUNT}" -gt 0 ]; then
               echo "Inspector scan complete - findings detected" | tee -a "${SUMMARY_FILE}"
               FINDINGS_JSON="${FILTERED_FINDINGS}"
               break
             fi
-            
+
             # If this is the last attempt, accept 0 findings as valid
             if [ ${ATTEMPT} -eq ${MAX_ATTEMPTS} ]; then
               echo "Inspector scan timeout - assuming no vulnerabilities found" | tee -a "${SUMMARY_FILE}"
               break
             fi
-            
+
             sleep ${SLEEP_INTERVAL}
           done
-          
-          # Count findings by severity (using the filtered findings)
-          CRITICAL=$(echo "${FINDINGS_JSON}" | jq -r '[.findings[] | select(.severity=="CRITICAL")] | length' 2>/dev/null || echo "0")
-          HIGH=$(echo "${FINDINGS_JSON}" | jq -r '[.findings[] | select(.severity=="HIGH")] | length' 2>/dev/null || echo "0")
-          MEDIUM=$(echo "${FINDINGS_JSON}" | jq -r '[.findings[] | select(.severity=="MEDIUM")] | length' 2>/dev/null || echo "0")
-          
+
+          # Count findings by severity
+          CRITICAL=$(echo "${FINDINGS_JSON}" | jq -r '[.findings[] | select(.severity=="CRITICAL")] | length')
+          HIGH=$(echo "${FINDINGS_JSON}" | jq -r '[.findings[] | select(.severity=="HIGH")] | length')
+          MEDIUM=$(echo "${FINDINGS_JSON}" | jq -r '[.findings[] | select(.severity=="MEDIUM")] | length')
+
           echo "Inspector findings: CRITICAL=${CRITICAL}, HIGH=${HIGH}, MEDIUM=${MEDIUM}" | tee -a "${SUMMARY_FILE}"
-          
+
           if [ "${CRITICAL}" -gt 0 ]; then
             echo "FAIL: CRITICAL findings > 0" | tee -a "${SUMMARY_FILE}"
             exit 1
           fi
-          
+
           if [ "${FAIL_ON_HIGH}" = "1" ] && [ "${HIGH}" -gt "${HIGH_THRESHOLD}" ]; then
             echo "FAIL: HIGH findings (${HIGH}) exceed threshold (${HIGH_THRESHOLD})" | tee -a "${SUMMARY_FILE}"
             exit 1
           fi
-          
+
           echo "PASS: Inspector scan gate satisfied." | tee -a "${SUMMARY_FILE}"
 
           # --- Gate 2: IAM Wildcard ---
