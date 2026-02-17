@@ -33,3 +33,4 @@ Gate C: AWS Access Analyzer policy validation (catches syntax errors, security w
 
 Currently troubleshooting gate D Inspector API issues. Will provide full Readme upon completion
 
+AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
