@@ -5,8 +5,8 @@ env:
     AWS_REGION: us-east-1
     ECR_REPO: secure-health-api
     CONTAINER_NAME: secure-health-api
-    FAIL_ON_HIGH: "0"
-    HIGH_THRESHOLD: "3"
+    FAIL_ON_HIGH: "1"
+    HIGH_THRESHOLD: "0"
     TASK_ROLE_NAME: ecsTaskRole-secure-health-api
     EXEC_ROLE_NAME: ecsTaskExecutionRole-secure-health-api
     IAM_WILDCARD_RESOURCE_ALLOWLIST: arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
