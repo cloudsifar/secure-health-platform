@@ -47,7 +47,7 @@ phases:
             MESSAGE="Secure Health Platform pipeline failure.
 
           Gate: ${CURRENT_GATE}
-          Repo: ${CODEBUILD_SOURCE_REPO_URL:-unknown}
+          Repo: ${GITHUB_REPO_URL:-unknown}
           Commit: ${CODEBUILD_RESOLVED_SOURCE_VERSION:-unknown}
           Image: ${REPO_URI:-unknown}:${IMAGE_TAG:-unknown}
           Build ID: ${CODEBUILD_BUILD_ID:-unknown}
