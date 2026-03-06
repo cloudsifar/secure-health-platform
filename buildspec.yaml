@@ -84,9 +84,13 @@ phases:
           echo '{"findings":[]}' > "${FINDINGS_FILE}"
 
           # Poll Inspector for findings (up to 3 minutes)
+          # After first findings appear, continue polling for SETTLE_CYCLES more
+          # iterations to let Inspector finish indexing all vulnerabilities
           MAX_ATTEMPTS=36
           SLEEP_INTERVAL=5
+          SETTLE_CYCLES=3
           ATTEMPT=0
+          FIRST_FOUND_AT=""
 
           while [ ${ATTEMPT} -lt ${MAX_ATTEMPTS} ]; do
             ATTEMPT=$((ATTEMPT + 1))
@@ -107,12 +111,21 @@ phases:
             echo "Inspector scan attempt ${ATTEMPT}/${MAX_ATTEMPTS}: ${FINDING_COUNT} findings" | tee -a "${SUMMARY_FILE}"
 
             if [ "${FINDING_COUNT}" -gt 0 ]; then
-              echo "Inspector scan complete - findings detected" | tee -a "${SUMMARY_FILE}"
-              break
+              if [ -z "${FIRST_FOUND_AT}" ]; then
+                FIRST_FOUND_AT=${ATTEMPT}
+                echo "Findings first detected at attempt ${ATTEMPT} - waiting for scan to stabilise..." | tee -a "${SUMMARY_FILE}"
+              elif [ $((ATTEMPT - FIRST_FOUND_AT)) -ge ${SETTLE_CYCLES} ]; then
+                echo "Inspector scan stabilised after ${SETTLE_CYCLES} settle cycles - ${FINDING_COUNT} findings" | tee -a "${SUMMARY_FILE}"
+                break
+              fi
             fi
 
             if [ ${ATTEMPT} -eq ${MAX_ATTEMPTS} ]; then
-              echo "Inspector scan timeout - assuming no vulnerabilities found" | tee -a "${SUMMARY_FILE}"
+              if [ -n "${FIRST_FOUND_AT}" ]; then
+                echo "Inspector scan timeout - proceeding with ${FINDING_COUNT} findings" | tee -a "${SUMMARY_FILE}"
+              else
+                echo "Inspector scan timeout - assuming no vulnerabilities found" | tee -a "${SUMMARY_FILE}"
+              fi
               break
             fi
 
