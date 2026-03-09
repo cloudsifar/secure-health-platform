@@ -103,7 +103,7 @@ phases:
               --max-results 100 \
               --output json > "${FINDINGS_FILE}" || {
                 echo "FAIL: Inspector API query failed - blocking deployment" | tee -a "${SUMMARY_FILE}"
-                exit 1
+                false
               }
 
             FINDING_COUNT=$(jq -r '.findings | length' "${FINDINGS_FILE}")
@@ -143,12 +143,12 @@ phases:
 
           if [ "${CRITICAL}" -gt 0 ]; then
             echo "FAIL: CRITICAL findings > 0" | tee -a "${SUMMARY_FILE}"
-            exit 1
+            false
           fi
 
           if [ "${FAIL_ON_HIGH}" = "1" ] && [ "${HIGH}" -gt "${HIGH_THRESHOLD}" ]; then
             echo "FAIL: HIGH findings (${HIGH}) exceed threshold (${HIGH_THRESHOLD})" | tee -a "${SUMMARY_FILE}"
-            exit 1
+            false
           fi
 
           echo "PASS: Inspector scan gate satisfied." | tee -a "${SUMMARY_FILE}"
