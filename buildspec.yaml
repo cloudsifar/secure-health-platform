@@ -10,7 +10,7 @@ env:
     TASK_ROLE_NAME: ecsTaskRole-secure-health-api
     EXEC_ROLE_NAME: ecsTaskExecutionRole-secure-health-api
     IAM_WILDCARD_RESOURCE_ALLOWLIST: arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
-    IAM_VALIDATE_FAIL_ON: "ERROR"
+    IAM_VALIDATE_FAIL_ON: "SECURITY_WARNING"
     SNS_TOPIC_ARN: "REPLACE_WITH_YOUR_SNS_TOPIC_ARN"
 
 phases:
