@@ -33,5 +33,3 @@ Gate C: AWS Access Analyzer policy validation (catches syntax errors, security w
 
 
 
-Oh no! I've gone and uploaded my access key!
-AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
