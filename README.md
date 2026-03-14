@@ -33,4 +33,4 @@ Gate C: AWS Access Analyzer policy validation (catches syntax errors, security w
 
 Currently troubleshooting gate D Inspector API issues. Will provide full Readme upon completion
 
-Another test for gate C with new inline policy
+Another test for gate B
