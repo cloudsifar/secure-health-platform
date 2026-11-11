@@ -29,6 +29,7 @@ Gate A: ECR vulnerability scanning (blocks CRITICAL CVEs)
 Gate B: Custom IAM wildcard detection (prevents Action:/Resource: except allowlisted policies)
 Gate C: AWS Access Analyzer policy validation (catches syntax errors, security warnings)
 
+11/11/2026: Reordering gates and updating scripts
 
 
 
