@@ -1,0 +1,38 @@
+{
+  "rules": [
+    {
+      "rulePriority": 1,
+      "description": "Keep the 20 most recent release images. Highest priority so these 20 can never be expired by a lower rule (e.g. if a candidate- tag was left on one).",
+      "selection": {
+        "tagStatus": "tagged",
+        "tagPrefixList": ["release-"],
+        "countType": "imageCountMoreThan",
+        "countNumber": 20
+      },
+      "action": { "type": "expire" }
+    },
+    {
+      "rulePriority": 2,
+      "description": "Expire unpromoted candidate images (failed Gate 4 or never promoted) after 1 day",
+      "selection": {
+        "tagStatus": "tagged",
+        "tagPrefixList": ["candidate-"],
+        "countType": "sinceImagePushed",
+        "countUnit": "days",
+        "countNumber": 1
+      },
+      "action": { "type": "expire" }
+    },
+    {
+      "rulePriority": 3,
+      "description": "Expire untagged images after 1 day",
+      "selection": {
+        "tagStatus": "untagged",
+        "countType": "sinceImagePushed",
+        "countUnit": "days",
+        "countNumber": 1
+      },
+      "action": { "type": "expire" }
+    }
+  ]
+}

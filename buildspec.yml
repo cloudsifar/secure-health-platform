@@ -1,0 +1,401 @@
+version: 0.2
+
+# cp-secure-health-platform v2 - shift-left gate order, digest-pinned deploys
+#
+#   Gate 1  Source Security Scan
+#             a) gitleaks: credentials anywhere in the tree (pinned, checksum-verified)
+#             b) ci_source_scan_gate.py: dangerous Python calls + Dockerfile policy
+#   Gate 2  IAM Wildcard
+#   Gate 3  IAM ValidatePolicy (Access Analyzer)
+#   Build   docker build, push as candidate-<tag>; verify digest + single-image manifest
+#   Gate 4  Inspector CVE scan of that exact digest (fail-closed on timeout)
+#   Promote add release-<tag> to the same digest, verify, drop candidate-<tag>
+#   Artifact imagedefinitions.json -> <repo>@sha256:<digest>   (never a tag)
+#
+# One digest is scanned, promoted and deployed. Any failure trips the ERR trap,
+# sends the SNS email and stops the build.
+#
+# Set at CodeBuild project level (not here): SNS_TOPIC_ARN, GITHUB_REPO_URL.
+# Project-level env vars override the values below, so temporary test
+# overrides (e.g. HIGH_THRESHOLD=0) belong on the project, not in this file.
+
+env:
+  shell: bash
+  variables:
+    AWS_REGION: us-east-1
+    ECR_REPO: secure-health-api
+    CONTAINER_NAME: secure-health-api
+    DOCKER_CONTEXT: ./app
+    # Gate 1
+    GITLEAKS_VERSION: "8.30.1"
+    # sha256 of gitleaks_<GITLEAKS_VERSION>_linux_x64.tar.gz from the release's
+    # official checksums file. The build refuses to run until this is set.
+    GITLEAKS_SHA256: "d29144deff3a68aa93ced33dddf84b7fdc26070add4aa0f4513094c8332afc4e"
+    SCAN_MAX_FILE_BYTES: "512000"
+    # Gates 2 and 3
+    TASK_ROLE_NAME: ecsTaskRole-secure-health-api
+    EXEC_ROLE_NAME: ecsTaskExecutionRole-secure-health-api
+    IAM_WILDCARD_RESOURCE_ALLOWLIST: arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+    IAM_VALIDATE_FAIL_ON: "SECURITY_WARNING"
+    # Gate 4
+    FAIL_ON_HIGH: "1"
+    HIGH_THRESHOLD: "1"
+    INSPECTOR_MAX_ATTEMPTS: "60"
+    INSPECTOR_SLEEP_SECONDS: "10"
+    INSPECTOR_SETTLE_POLLS: "3"
+
+phases:
+  build:
+    commands:
+      - |
+        set -euo pipefail
+
+        SUMMARY_FILE="/tmp/gate_summary.txt"
+        : > "${SUMMARY_FILE}"
+
+        CURRENT_GATE="Setup"
+        : "${SNS_TOPIC_ARN:?SNS_TOPIC_ARN must be set as a CodeBuild project environment variable}"
+        AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+        REPO_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
+        COMMIT_SHA="${CODEBUILD_RESOLVED_SOURCE_VERSION:-unknown}"
+        IMAGE_TAG="${COMMIT_SHA:0:7}-${CODEBUILD_BUILD_NUMBER:-0}"
+        CANDIDATE_TAG="candidate-${IMAGE_TAG}"
+        RELEASE_TAG="release-${IMAGE_TAG}"
+        SRC_DIR="${CODEBUILD_SRC_DIR:-$(pwd)}"
+        IMAGE_REF="not built (failed before build)"
+
+        log_step () { echo "$1" | tee -a "${SUMMARY_FILE}"; }
+
+        notify_failure () {
+          LOG_SNIPPET="$(tail -n 40 "${SUMMARY_FILE}" 2>/dev/null || true)"
+          MESSAGE="Secure Health Platform pipeline failure.
+
+        Gate: ${CURRENT_GATE}
+        Repo: ${GITHUB_REPO_URL:-unknown}
+        Commit: ${COMMIT_SHA}
+        Image: ${IMAGE_REF}
+        Build ID: ${CODEBUILD_BUILD_ID:-unknown}
+
+        Recent log summary:
+        ${LOG_SNIPPET}"
+
+          aws sns publish \
+            --region "${AWS_REGION}" \
+            --topic-arn "${SNS_TOPIC_ARN}" \
+            --subject "🚨 cp-secure-health-platform FAILED (${CURRENT_GATE})" \
+            --message "${MESSAGE}" > /dev/null
+        }
+
+        trap 'log_step "[TRAP] Failure detected in ${CURRENT_GATE}"; notify_failure' ERR
+
+        # Fail-closed rule for this script: failures are signalled with `false`
+        # (never `exit 1`), and commands that may legitimately fail are tested
+        # with `if ! cmd; then ... false; fi` or `cmd || RC=$?`, so the ERR
+        # trap always fires on a real failure.
+
+        log_step "Commit: ${COMMIT_SHA}"
+        log_step "Candidate tag: ${CANDIDATE_TAG}"
+
+        # ===================================================================
+        # Gate 1: Source Security Scan
+        #   a) gitleaks - credential detection across the whole tree
+        #   b) policy script - dangerous Python calls + Dockerfile policy
+        # Both run, then the gate fails once if either found anything, so a
+        # single email shows every Gate 1 problem.
+        # ===================================================================
+        CURRENT_GATE="Gate 1: Source Security Scan"
+        log_step "== ${CURRENT_GATE} =="
+
+        if [ -z "${GITLEAKS_SHA256}" ] || [ "${GITLEAKS_SHA256}" = "REPLACE_WITH_SHA256" ]; then
+          log_step "FAIL: GITLEAKS_SHA256 is not set - refusing to run an unverified scanner"
+          false
+        fi
+
+        GL_DIR="/tmp/gitleaks-bin"
+        GL_TARBALL="/tmp/gitleaks.tar.gz"
+        GL_URL="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+        mkdir -p "${GL_DIR}"
+        if ! curl -fsSL --retry 3 -o "${GL_TARBALL}" "${GL_URL}"; then
+          log_step "FAIL: could not download gitleaks v${GITLEAKS_VERSION}"
+          false
+        fi
+        if ! echo "${GITLEAKS_SHA256}  ${GL_TARBALL}" | sha256sum -c - > /dev/null 2>&1; then
+          log_step "FAIL: gitleaks checksum mismatch - expected ${GITLEAKS_SHA256}, got $(sha256sum "${GL_TARBALL}" | cut -d' ' -f1)"
+          false
+        fi
+        tar -xzf "${GL_TARBALL}" -C "${GL_DIR}" gitleaks
+        log_step "gitleaks v${GITLEAKS_VERSION} downloaded, checksum verified"
+
+        GL_REPORT="/tmp/gitleaks-report.json"
+        rm -f "${GL_REPORT}"   # never read a stale report as this run's result
+        GL_RC=0
+        "${GL_DIR}/gitleaks" dir "${SRC_DIR}" \
+          --no-banner --redact --log-level warn \
+          --report-format json --report-path "${GL_REPORT}" \
+          --exit-code 1 > /tmp/gitleaks.log 2>&1 || GL_RC=$?
+
+        GL_COUNT=0
+        if [ -s "${GL_REPORT}" ]; then
+          GL_COUNT="$(jq 'length' "${GL_REPORT}")"
+        fi
+        GATE1_FAILED=0
+        if [ "${GL_COUNT}" -gt 0 ]; then
+          jq -r --arg root "${SRC_DIR}/" \
+            '.[] | "ERROR: FINDING [gitleaks:\(.RuleID)] \(.File | ltrimstr($root)):\(.StartLine)"' \
+            "${GL_REPORT}" | tee -a "${SUMMARY_FILE}"
+          log_step "gitleaks: ${GL_COUNT} credential finding(s). Remove the secret AND rotate it - it is already in Git history."
+          GATE1_FAILED=1
+        elif [ "${GL_RC}" -ne 0 ]; then
+          log_step "FAIL: gitleaks exited ${GL_RC} without a report (scanner error):"
+          tail -n 10 /tmp/gitleaks.log | tee -a "${SUMMARY_FILE}"
+          GATE1_FAILED=1
+        else
+          log_step "INFO: gitleaks: 0 credential findings"
+        fi
+
+        python3 scripts/ci_source_scan_gate.py 2>&1 | tee -a "${SUMMARY_FILE}" || GATE1_FAILED=1
+
+        if [ "${GATE1_FAILED}" -ne 0 ]; then
+          log_step "FAIL: Source Security Scan failed - see findings above."
+          false
+        fi
+        log_step "PASS: Source Security Scan satisfied."
+
+        # ===================================================================
+        # Gate 2: IAM Wildcard
+        # ===================================================================
+        CURRENT_GATE="Gate 2: IAM Wildcard Gate"
+        log_step "== ${CURRENT_GATE} =="
+        python3 scripts/ci_iam_wildcard_gate.py 2>&1 | tee -a "${SUMMARY_FILE}"
+
+        # ===================================================================
+        # Gate 3: IAM ValidatePolicy (Access Analyzer)
+        # ===================================================================
+        CURRENT_GATE="Gate 3: IAM ValidatePolicy Gate"
+        log_step "== ${CURRENT_GATE} =="
+        python3 scripts/ci_iam_validate_policy_gate.py 2>&1 | tee -a "${SUMMARY_FILE}"
+
+        # ===================================================================
+        # Build and push candidate (first point anything reaches ECR)
+        # ===================================================================
+        CURRENT_GATE="Build: Docker build and push candidate"
+        log_step "== ${CURRENT_GATE} =="
+
+        aws ecr get-login-password --region "${AWS_REGION}" \
+          | docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com" > /dev/null
+
+        BUILD_LOG="/tmp/docker_build.log"
+        if ! docker build -t "${REPO_URI}:${CANDIDATE_TAG}" "${DOCKER_CONTEXT}" > "${BUILD_LOG}" 2>&1; then
+          cat "${BUILD_LOG}"
+          log_step "FAIL: docker build failed (last 20 lines):"
+          tail -n 20 "${BUILD_LOG}" | tee -a "${SUMMARY_FILE}"
+          false
+        fi
+        cat "${BUILD_LOG}"
+        log_step "Built image ${REPO_URI}:${CANDIDATE_TAG}"
+
+        if ! docker push "${REPO_URI}:${CANDIDATE_TAG}" > /tmp/docker_push.log 2>&1; then
+          cat /tmp/docker_push.log
+          log_step "FAIL: docker push failed (last 10 lines):"
+          tail -n 10 /tmp/docker_push.log | tee -a "${SUMMARY_FILE}"
+          false
+        fi
+        IMAGE_REF="${REPO_URI}:${CANDIDATE_TAG}"
+        log_step "Pushed ${IMAGE_REF}"
+
+        PUSHED_DIGEST="$(docker inspect "${REPO_URI}:${CANDIDATE_TAG}" --format='{{index .RepoDigests 0}}' | cut -d'@' -f2)"
+
+        # --- Verify what ECR actually stored: digest and manifest type ---
+        # Ask for index types too, so an image index is reported as one and
+        # not silently converted.
+        aws ecr batch-get-image \
+          --region "${AWS_REGION}" \
+          --repository-name "${ECR_REPO}" \
+          --image-ids imageTag="${CANDIDATE_TAG}" \
+          --accepted-media-types \
+            "application/vnd.docker.distribution.manifest.v2+json" \
+            "application/vnd.oci.image.manifest.v1+json" \
+            "application/vnd.docker.distribution.manifest.list.v2+json" \
+            "application/vnd.oci.image.index.v1+json" \
+          --output json > /tmp/batch_get_image.json
+
+        if [ "$(jq -r '.images | length' /tmp/batch_get_image.json)" -ne 1 ]; then
+          log_step "FAIL: candidate image not found in ECR after push"
+          false
+        fi
+        IMAGE_DIGEST="$(jq -r '.images[0].imageId.imageDigest' /tmp/batch_get_image.json)"
+        MEDIA_TYPE="$(jq -r '.images[0].imageManifestMediaType' /tmp/batch_get_image.json)"
+        jq -r '.images[0].imageManifest' /tmp/batch_get_image.json > /tmp/image_manifest.json
+
+        if [ -z "${PUSHED_DIGEST}" ] || [ "${IMAGE_DIGEST}" != "${PUSHED_DIGEST}" ]; then
+          log_step "FAIL: digest mismatch - docker pushed '${PUSHED_DIGEST}', ECR holds '${IMAGE_DIGEST}'"
+          false
+        fi
+        case "${MEDIA_TYPE}" in
+          application/vnd.docker.distribution.manifest.v2+json|application/vnd.oci.image.manifest.v1+json)
+            ;;
+          *)
+            log_step "FAIL: manifest type '${MEDIA_TYPE}' is not a single-image manifest."
+            log_step "      An image index would mean the deployed digest is not the digest Inspector scanned."
+            false
+            ;;
+        esac
+        IMAGE_REF="${REPO_URI}:${CANDIDATE_TAG} (${IMAGE_DIGEST})"
+        log_step "Image digest: ${IMAGE_DIGEST}"
+        log_step "Manifest type: ${MEDIA_TYPE} (single image - verified)"
+
+        # ===================================================================
+        # Gate 4: Inspector Enhanced CVE scan of this exact digest (fail-closed)
+        #   1. Wait until ECR reports the enhanced scan as ACTIVE/COMPLETE
+        #   2. Poll findings until the count is stable for
+        #      INSPECTOR_SETTLE_POLLS consecutive polls (indexing lag)
+        #   3. Timeout or scan error = FAIL
+        # ===================================================================
+        CURRENT_GATE="Gate 4: ECR Vulnerability Scan (Inspector Enhanced)"
+        log_step "== ${CURRENT_GATE} =="
+
+        FINDINGS_FILE="/tmp/inspector_findings.json"
+        STATUS_ERR="/tmp/scan_status.err"
+        ATTEMPT=0
+        STABLE=0
+        LAST_COUNT=-1
+        SETTLED=0
+
+        while [ "${ATTEMPT}" -lt "${INSPECTOR_MAX_ATTEMPTS}" ]; do
+          ATTEMPT=$((ATTEMPT + 1))
+
+          SCAN_STATUS="$(aws ecr describe-image-scan-findings \
+            --region "${AWS_REGION}" \
+            --repository-name "${ECR_REPO}" \
+            --image-id imageDigest="${IMAGE_DIGEST}" \
+            --query 'imageScanStatus.status' \
+            --output text 2> "${STATUS_ERR}")" || SCAN_STATUS="NOT_STARTED"
+
+          if grep -qE 'AccessDenied|UnauthorizedOperation' "${STATUS_ERR}"; then
+            log_step "FAIL: no permission to read scan status (ecr:DescribeImageScanFindings)"
+            false
+          fi
+
+          case "${SCAN_STATUS}" in
+            ACTIVE|COMPLETE)
+              ;;
+            FAILED|UNSUPPORTED_IMAGE|SCAN_ELIGIBILITY_EXPIRED|FINDINGS_UNAVAILABLE|LIMIT_EXCEEDED|IMAGE_ARCHIVED)
+              log_step "FAIL: Inspector scan status ${SCAN_STATUS} - blocking deployment"
+              false
+              ;;
+            *)
+              log_step "Inspector scan attempt ${ATTEMPT}/${INSPECTOR_MAX_ATTEMPTS}: scan status ${SCAN_STATUS}, waiting"
+              sleep "${INSPECTOR_SLEEP_SECONDS}"
+              continue
+              ;;
+          esac
+
+          # Server-side filter: this repository + this exact image digest only.
+          # Output goes to a file to avoid shell ARG_MAX limits; the CLI paginates.
+          if ! aws inspector2 list-findings \
+                --region "${AWS_REGION}" \
+                --filter-criteria "{\"ecrImageRepositoryName\":[{\"comparison\":\"EQUALS\",\"value\":\"${ECR_REPO}\"}],\"ecrImageHash\":[{\"comparison\":\"EQUALS\",\"value\":\"${IMAGE_DIGEST}\"}]}" \
+                --output json > "${FINDINGS_FILE}"; then
+            log_step "FAIL: Inspector API query failed - blocking deployment"
+            false
+          fi
+
+          FINDING_COUNT="$(jq -r '.findings | length' "${FINDINGS_FILE}")"
+          if [ "${FINDING_COUNT}" -eq "${LAST_COUNT}" ]; then
+            STABLE=$((STABLE + 1))
+          else
+            STABLE=1
+            LAST_COUNT="${FINDING_COUNT}"
+          fi
+
+          log_step "Inspector scan attempt ${ATTEMPT}/${INSPECTOR_MAX_ATTEMPTS}: status ${SCAN_STATUS}, ${FINDING_COUNT} findings (stable ${STABLE}/${INSPECTOR_SETTLE_POLLS})"
+
+          if [ "${STABLE}" -ge "${INSPECTOR_SETTLE_POLLS}" ]; then
+            SETTLED=1
+            break
+          fi
+          sleep "${INSPECTOR_SLEEP_SECONDS}"
+        done
+
+        if [ "${SETTLED}" -ne 1 ]; then
+          log_step "FAIL: Inspector scan did not complete within $((INSPECTOR_MAX_ATTEMPTS * INSPECTOR_SLEEP_SECONDS))s - blocking deployment"
+          false
+        fi
+        log_step "Inspector scan complete - findings settled"
+
+        CRITICAL="$(jq -r '[.findings[] | select(.severity=="CRITICAL")] | length' "${FINDINGS_FILE}")"
+        HIGH="$(jq -r '[.findings[] | select(.severity=="HIGH")] | length' "${FINDINGS_FILE}")"
+        MEDIUM="$(jq -r '[.findings[] | select(.severity=="MEDIUM")] | length' "${FINDINGS_FILE}")"
+        log_step "Inspector findings: CRITICAL=${CRITICAL}, HIGH=${HIGH}, MEDIUM=${MEDIUM}"
+
+        # List the blocking findings by title so the email is actionable
+        # (limit inside jq, not with `head`, so pipefail never sees a SIGPIPE)
+        jq -r '[.findings[] | select(.severity=="CRITICAL" or .severity=="HIGH")][:10][]
+               | "  \(.severity) \(.title)"' "${FINDINGS_FILE}" | tee -a "${SUMMARY_FILE}"
+
+        if [ "${CRITICAL}" -gt 0 ]; then
+          log_step "FAIL: CRITICAL findings > 0"
+          false
+        fi
+        if [ "${FAIL_ON_HIGH}" = "1" ] && [ "${HIGH}" -gt "${HIGH_THRESHOLD}" ]; then
+          log_step "FAIL: HIGH findings (${HIGH}) exceed threshold (${HIGH_THRESHOLD})"
+          false
+        fi
+        log_step "PASS: Inspector scan gate satisfied."
+
+        # ===================================================================
+        # Promote: add release-<tag> to the SAME manifest (same digest),
+        # verify it, then drop candidate-<tag>.
+        # The repository is IMMUTABLE: release- tags can never be repointed.
+        # ===================================================================
+        CURRENT_GATE="Promote: Retag release image"
+        log_step "== ${CURRENT_GATE} =="
+
+        aws ecr put-image \
+          --region "${AWS_REGION}" \
+          --repository-name "${ECR_REPO}" \
+          --image-tag "${RELEASE_TAG}" \
+          --image-manifest file:///tmp/image_manifest.json \
+          --image-manifest-media-type "${MEDIA_TYPE}" > /dev/null
+
+        RELEASE_DIGEST="$(aws ecr describe-images \
+          --region "${AWS_REGION}" \
+          --repository-name "${ECR_REPO}" \
+          --image-ids imageTag="${RELEASE_TAG}" \
+          --query 'imageDetails[0].imageDigest' --output text)"
+        if [ "${RELEASE_DIGEST}" != "${IMAGE_DIGEST}" ]; then
+          log_step "FAIL: ${RELEASE_TAG} resolves to ${RELEASE_DIGEST}, not the scanned digest ${IMAGE_DIGEST}"
+          false
+        fi
+        IMAGE_REF="${REPO_URI}:${RELEASE_TAG} (${IMAGE_DIGEST})"
+        log_step "Tagged ${RELEASE_TAG} -> ${RELEASE_DIGEST} (matches scanned digest)"
+
+        # Removing the candidate tag is housekeeping, not a security control:
+        # the lifecycle policy's release rule (priority 1) protects this image
+        # even if the candidate tag remains. So a failure here warns, not fails.
+        aws ecr batch-delete-image \
+          --region "${AWS_REGION}" \
+          --repository-name "${ECR_REPO}" \
+          --image-ids imageTag="${CANDIDATE_TAG}" \
+          --output json > /tmp/batch_delete_image.json 2>&1 || true
+        if [ "$(jq -r '(.failures // [1]) | length' /tmp/batch_delete_image.json 2>/dev/null || echo 1)" -ne 0 ]; then
+          log_step "WARNING: could not remove ${CANDIDATE_TAG} (image stays protected by the release rule):"
+          head -c 400 /tmp/batch_delete_image.json | tee -a "${SUMMARY_FILE}"
+          echo "" | tee -a "${SUMMARY_FILE}"
+        else
+          log_step "Removed tag ${CANDIDATE_TAG}"
+        fi
+
+        # ===================================================================
+        # Artifact for the ECS deploy action: the DIGEST, never a tag
+        # ===================================================================
+        CURRENT_GATE="Artifacts: Write imagedefinitions.json"
+        log_step "== ${CURRENT_GATE} =="
+        printf '[{"name":"%s","imageUri":"%s@%s"}]' "${CONTAINER_NAME}" "${REPO_URI}" "${IMAGE_DIGEST}" > imagedefinitions.json
+        cat imagedefinitions.json | tee -a "${SUMMARY_FILE}"
+        echo "" | tee -a "${SUMMARY_FILE}"
+        log_step "PASS: All gates satisfied. Deploying ${RELEASE_TAG} by digest ${IMAGE_DIGEST}."
+
+artifacts:
+  files:
+    - imagedefinitions.json

@@ -1,0 +1,11 @@
+# Local secrets check: runs gitleaks on staged changes before every commit.
+# Setup:  pip install pre-commit && pre-commit install
+# Keep `rev` in step with GITLEAKS_VERSION in buildspec.yml so the local hook
+# and the pipeline backstop apply the same rules.
+# The pipeline's Gate 1 is the backstop: this hook can be skipped
+# (git commit --no-verify, SKIP=gitleaks) or simply never installed.
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks

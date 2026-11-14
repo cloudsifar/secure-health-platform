@@ -1,36 +1,7 @@
 Security-Gated CI/CD Pipeline (GitHub → CodePipeline → ECR → ECS)
-Automated deployment pipeline with three security gates:
+Automated deployment pipeline with multiple security gates:
 
-Gate A: ECR vulnerability scanning (blocks CRITICAL CVEs)
-Gate B: Custom IAM wildcard detection (prevents Action:/Resource: except allowlisted policies)
-Gate C: AWS Access Analyzer policy validation (catches syntax errors, security warnings)
-
-Currently developing Gate D and a reporting tool. Will provide full Readme upon completion
-Security-Gated CI/CD Pipeline (GitHub → CodePipeline → ECR → ECS)
-Automated deployment pipeline with three security gates:
-
-Gate A: ECR vulnerability scanning (blocks CRITICAL CVEs)
-Gate B: Custom IAM wildcard detection (prevents Action:/Resource: except allowlisted policies)
-Gate C: AWS Access Analyzer policy validation (catches syntax errors, security warnings)
-
-Currently developing Gate D and a reporting tool. Will provide full Readme upon completion
-Security-Gated CI/CD Pipeline (GitHub → CodePipeline → ECR → ECS)
-Automated deployment pipeline with three security gates:
-
-Gate A: ECR vulnerability scanning (blocks CRITICAL CVEs)
-Gate B: Custom IAM wildcard detection (prevents Action:/Resource: except allowlisted policies)
-Gate C: AWS Access Analyzer policy validation (catches syntax errors, security warnings)
-
-Currently developing Gate D and a reporting tool. Will provide full Readme upon completion
-Security-Gated CI/CD Pipeline (GitHub → CodePipeline → ECR → ECS)
-Automated deployment pipeline with three security gates:
-
-Gate A: ECR vulnerability scanning (blocks CRITICAL CVEs)
-Gate B: Custom IAM wildcard detection (prevents Action:/Resource: except allowlisted policies)
-Gate C: AWS Access Analyzer policy validation (catches syntax errors, security warnings)
-
-11/11/2026: Reordering gates and updating scripts
-
+v2 design and gate order: see docs/pipeline-v2.md
 
 
 
